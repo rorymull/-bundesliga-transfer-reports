@@ -2,12 +2,13 @@
 """
 Scrape Bundesliga defender transfer rumours from Transfermarkt (detailed view).
 
-- Robust to nested <td> in player cell (uses recursive=False)
-- Maps columns by reading table headers (EN/DE), with sensible fallbacks
-- Extracts clubs from <a href*="/verein/"> reliably
-- Prefers external source links; falls back to internal normalized URLs
-- Filters to defender positions using expanded English/German keywords
-- Outputs JSON and an HTML summary table
+Changes in v1.3:
+- Extract club names from <a title> or nested <img alt> when link text is empty.
+- Keep nested-cell fix (recursive=False) to avoid column shifts.
+- Header-based column mapping (EN/DE) with safe defaults.
+- External-source preference for source links; fall back to normalized internal.
+- Defender filtering via EN/DE keywords.
+- Outputs JSON + an HTML summary, plus debug artifacts if parsing yields nothing.
 
 Env vars:
   COMPETITION (default "L1")
@@ -31,7 +32,7 @@ SEASON_ID = os.getenv("SEASON_ID", "2025")
 URL = f"{BASE_URL}/bundesliga/geruechte/wettbewerb/{COMPETITION}/saison_id/{SEASON_ID}/plus/1"
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) DefenderRumoursBot/1.2",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) DefenderRumoursBot/1.3",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-GB,en;q=0.9,de;q=0.7",
     "Referer": BASE_URL + "/",
@@ -90,7 +91,6 @@ def fetch_with_retries(url: str, max_retries: int = 3, backoff: float = 1.5) -> 
             last_exc = e
             if i < max_retries:
                 time.sleep(backoff * i)
-    # If we reach here, raise last error
     if last_exc:
         raise last_exc
     raise RuntimeError("Unknown error performing GET")
@@ -119,10 +119,7 @@ def parse_probability(s: Optional[str]) -> Optional[int]:
 
 
 def map_columns(table: BeautifulSoup) -> Dict[str, int]:
-    """
-    Inspect the table header and map known columns to indices.
-    If headers are missing or icon-only, fall back to typical indices.
-    """
+    """Inspect the table header and map known columns to indices. Provide safe defaults."""
     mapping: Dict[str, int] = {}
     thead = table.find("thead")
     if thead:
@@ -132,7 +129,7 @@ def map_columns(table: BeautifulSoup) -> Dict[str, int]:
                 if any(alias in h for alias in aliases):
                     mapping[key] = idx
 
-    # Ensure required minimum mapping with sensible defaults
+    # Sensible defaults if headers are sparse/icon-only
     mapping.setdefault("player", 0)
     mapping.setdefault("current_club", 2)
     mapping.setdefault("interested_club", 3)
@@ -142,10 +139,7 @@ def map_columns(table: BeautifulSoup) -> Dict[str, int]:
 
 
 def extract_position_from_player_cell(player_cell) -> str:
-    """
-    Try to extract a position string from within the player cell (detailed layout).
-    """
-    # Look into common sub-elements first
+    """Try to extract a position string from within the player cell (detailed layout)."""
     for sel in ["table.inline-table td", "small", "span", ".position"]:
         for el in player_cell.select(sel):
             t = text(el)
@@ -160,28 +154,50 @@ def extract_position_from_player_cell(player_cell) -> str:
     return m.group(0) if m else ""
 
 
+def club_name_from_anchor(a) -> str:
+    """Extract a club name from an <a> element that may contain only a logo."""
+    if not a:
+        return ""
+    for attr in ("title", "aria-label", "data-original-title"):
+        val = a.get(attr)
+        if val and val.strip():
+            return val.strip()
+    img = a.find("img")
+    if img:
+        for attr in ("alt", "title"):
+            val = img.get(attr)
+            if val and val.strip():
+                return val.strip()
+    # Last resort: visible text (often empty for logo-only links)
+    return text(a)
+
+
 def first_club_from_cell(cell) -> str:
     a = cell.select_one('a[href*="/startseite/verein/"], a[href*="/verein/"]')
-    return text(a) if a else text(cell)
+    return club_name_from_anchor(a) if a else text(cell)
 
 
 def interested_clubs_from_cell(cell) -> str:
-    names = [text(a) for a in cell.select('a[href*="/startseite/verein/"], a[href*="/verein/"]')]
-    if names:
-        # Return the first club (schema expects single string)
-        return names[0]
-    return text(cell)
+    anchors = cell.select('a[href*="/startseite/verein/"], a[href*="/verein/"]')
+    names = []
+    seen = set()
+    for a in anchors:
+        name = club_name_from_anchor(a)
+        if name and name not in seen:
+            names.append(name)
+            seen.add(name)
+    return ", ".join(names) if names else text(cell)
 
 
 def source_href_from_cell(cell) -> str:
     # Prefer external sources; else fall back to internal link (normalized with urljoin)
     for a in cell.select('a[href]'):
-        href = a.get("href") or ""
+        href = (a.get("href") or "").strip()
         if href.startswith("http") and "transfermarkt." not in href:
             return href
     a = cell.select_one("a[href]")
     if a:
-        raw = a.get("href") or ""
+        raw = (a.get("href") or "").strip()
         return urljoin(URL, raw) if raw else ""
     return ""
 
@@ -235,7 +251,7 @@ def main():
     col_idx = map_columns(table) if table else {}
 
     for tr in rows:
-        # CRITICAL: only top-level td's; ignore nested inline-table cells
+        # Only top-level td's; ignore nested inline-table cells in detailed layout
         tds = tr.find_all("td", recursive=False)
         if not tds:
             continue
@@ -245,10 +261,10 @@ def main():
         player_cell = tds[p_idx] if len(tds) > p_idx else None
         if not player_cell:
             continue
-        player_link = player_cell.select_one("a[href*='/profil/spieler/']")
+        player_link = player_cell.select_one("a[href*='/profil/spieler/']") or player_cell.select_one("a[href*='/spieler/']")
         player = text(player_link) if player_link else text(player_cell)
 
-        # Position heuristics from the player cell
+        # Position from the player cell
         pos_txt = extract_position_from_player_cell(player_cell)
 
         # Row-level text for fallbacks
@@ -271,7 +287,7 @@ def main():
         source_cell = tds[src_idx] if len(tds) > src_idx else None
         source_link = source_href_from_cell(source_cell) if source_cell else ""
 
-        # Probability (prefer cell, fallback to scanning entire row)
+        # Probability (prefer cell, then scan the row)
         pr_idx = col_idx.get("probability", 5)
         prob_txt_cell = text(tds[pr_idx]) if len(tds) > pr_idx else ""
         prob = parse_probability(prob_txt_cell) or parse_probability(row_txt)
