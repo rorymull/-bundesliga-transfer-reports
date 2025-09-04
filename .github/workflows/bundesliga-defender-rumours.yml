@@ -7,15 +7,16 @@ on:
 
 permissions:
   contents: read
+  pages: write
+  id-token: write
 
 jobs:
-  scrape:
+  build:
     runs-on: ubuntu-latest
-    outputs:
-      artifact-path: ${{ steps.outpath.outputs.path }}
     steps:
       - uses: actions/checkout@v4
 
+      # If you added requirements.txt, keep caching; otherwise remove cache lines.
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -26,6 +27,8 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
+          # If you DON'T have requirements.txt, replace the next line with:
+          # pip install requests beautifulsoup4 lxml
           pip install -r requirements.txt
 
       - name: Scrape Transfermarkt defenders
@@ -33,30 +36,34 @@ jobs:
           COMPETITION: L1
           SEASON_ID: '2025'
         run: |
-          # If your file is NOT in scripts/, change the line below to: python scrape_defenders.py
-          python scripts/scrape_defenders.py
+          # Adjust the path to where your script actually lives
+          if [ -f scripts/scrape_defenders.py ]; then
+            python scripts/scrape_defenders.py
+          else
+            python scrape_defenders.py
+          fi
 
-      - name: Expose out path
-        id: outpath
-        run: echo "path=out" >> "$GITHUB_OUTPUT"
+      - name: Verify output exists
+        run: |
+          ls -lah
+          ls -lah out || true
+          test -f out/defender_rumours.json
+
+      # ⬅️ Upload the Pages artifact from THIS job
+      - name: Upload artifact for GitHub Pages
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: out  # this contains defender_rumours.json
 
   deploy:
-    needs: scrape
+    needs: build
     runs-on: ubuntu-latest
-    permissions:
-      pages: write
-      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - name: Setup Pages
         uses: actions/configure-pages@v5
-
-      - name: Upload artifact
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: ${{ needs.scrape.outputs.artifact-path }}  # uploads 'out/'
 
       - name: Deploy to GitHub Pages
         id: deployment
