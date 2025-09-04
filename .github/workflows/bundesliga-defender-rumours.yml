@@ -2,12 +2,17 @@ name: bundesliga-defender-rumours
 
 on:
   schedule:
-    - cron: '30 7 * * *'  # 07:30 UTC daily → JSON is ready well before your 09:00 UK email
+    - cron: '30 7 * * *'   # 07:30 UTC daily
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
+    outputs:
+      artifact-path: ${{ steps.outpath.outputs.path }}
     steps:
       - uses: actions/checkout@v4
 
@@ -15,19 +20,42 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
       - name: Install deps
-        run: pip install requests beautifulsoup4 lxml
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4 lxml
 
       - name: Scrape Transfermarkt defenders
-        run: python scripts/scrape_defenders.py
-
-      - name: Publish JSON to Pages folder
+        env:
+          COMPETITION: L1
+          SEASON_ID: '2025'
         run: |
-          mkdir -p docs
-          mv out/defender_rumours.json docs/defender_rumours.json
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add docs/defender_rumours.json
-          git commit -m "Update defender_rumours.json [skip ci]" || echo "No changes"
-          git push
+          python scripts/scrape_defenders.py
+
+      - name: Expose out path
+        id: outpath
+        run: echo "path=out" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    needs: scrape
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ${{ needs.scrape.outputs.artifact-path }}
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
