@@ -1,20 +1,3 @@
-# scripts/scrape_defenders.py
-"""
-Scrape Bundesliga defender transfer rumours from Transfermarkt (detailed view).
-
-Changes in v1.3:
-- Extract club names from <a title> or nested <img alt> when link text is empty.
-- Keep nested-cell fix (recursive=False) to avoid column shifts.
-- Header-based column mapping (EN/DE) with safe defaults.
-- External-source preference for source links; fall back to normalized internal.
-- Defender filtering via EN/DE keywords.
-- Outputs JSON + an HTML summary, plus debug artifacts if parsing yields nothing.
-
-Env vars:
-  COMPETITION (default "L1")
-  SEASON_ID  (default "2025")
-"""
-
 import os
 import re
 import json
@@ -40,167 +23,76 @@ HEADERS = {
 }
 TIMEOUT = 30
 
-# Expanded defender keywords (case-insensitive).
 DEFENDER_KEYWORDS = {
-    # English
     "defender", "centre-back", "center-back", "centre back", "center back",
     "left-back", "left back", "right-back", "right back",
     "wing-back", "wingback", "full-back", "fullback",
-    # German (common forms)
     "innenverteidiger", "rechter verteidiger", "linker verteidiger",
     "außenverteidiger", "aussenverteidiger", "verteidiger",
 }
 
-# Header synonyms to map columns robustly (EN + DE)
-HEADER_ALIASES = {
-    "player": {"player", "spieler"},
-    "current_club": {"current club", "aktueller verein", "verein"},
-    "interested_club": {"interested club", "interessent", "interessenten"},
-    "source": {"source", "quelle"},
-    "probability": {"probability", "wahrscheinlichkeit"},
-}
-
-
-def fetch_with_retries(url: str, max_retries: int = 3, backoff: float = 1.5) -> requests.Response:
-    """GET with retry adapter + manual backoff."""
-    s = requests.Session()
-    # Attach retry adapter if available
-    try:
-        from requests.adapters import HTTPAdapter
-        from urllib3.util.retry import Retry  # type: ignore
-        retry = Retry(
-            total=max_retries,
-            backoff_factor=backoff,
-            status_forcelist=(429, 500, 502, 503, 504),
-            allowed_methods=frozenset(["GET"]),
-            raise_on_status=False,
-        )
-        adapter = HTTPAdapter(max_retries=retry)
-        s.mount("http://", adapter)
-        s.mount("https://", adapter)
-    except Exception:
-        pass
-
-    last_exc = None
-    for i in range(1, max_retries + 1):
-        try:
-            resp = s.get(url, headers=HEADERS, timeout=TIMEOUT)
-            resp.raise_for_status()
-            return resp
-        except Exception as e:
-            last_exc = e
-            if i < max_retries:
-                time.sleep(backoff * i)
-    if last_exc:
-        raise last_exc
-    raise RuntimeError("Unknown error performing GET")
-
+def fetch_html(url: str) -> str:
+    resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+    resp.raise_for_status()
+    return resp.text
 
 def norm(s: Optional[str]) -> str:
     return re.sub(r"\s+", " ", (s or "")).strip()
 
-
 def text(el) -> str:
     return norm(el.get_text(" ", strip=True)) if el else ""
-
 
 def is_defender(position_text: str) -> bool:
     p = (position_text or "").lower()
     return any(k in p for k in DEFENDER_KEYWORDS)
 
-
-def parse_probability(s: Optional[str]) -> Optional[int]:
-    m = re.search(r"(\d{1,3})\s*%", s or "")
-    if m:
-        val = int(m.group(1))
-        if 0 <= val <= 100:
-            return val
-    return None
-
-
-def map_columns(table: BeautifulSoup) -> Dict[str, int]:
-    """Inspect the table header and map known columns to indices. Provide safe defaults."""
-    mapping: Dict[str, int] = {}
-    thead = table.find("thead")
-    if thead:
-        headers = [text(th).lower() for th in thead.select("tr th")]
-        for idx, h in enumerate(headers):
-            for key, aliases in HEADER_ALIASES.items():
-                if any(alias in h for alias in aliases):
-                    mapping[key] = idx
-
-    # Sensible defaults if headers are sparse/icon-only
-    mapping.setdefault("player", 0)
-    mapping.setdefault("current_club", 2)
-    mapping.setdefault("interested_club", 3)
-    mapping.setdefault("source", 4)
-    mapping.setdefault("probability", 5)
-    return mapping
-
-
-def extract_position_from_player_cell(player_cell) -> str:
-    """Try to extract a position string from within the player cell (detailed layout)."""
+def extract_position_from_cell(cell) -> str:
     for sel in ["table.inline-table td", "small", "span", ".position"]:
-        for el in player_cell.select(sel):
+        for el in cell.select(sel):
             t = text(el)
-            if t and any(k in t.lower() for k in ("back", "verteidiger", "defender")):
+            if t and any(k in t.lower() for k in DEFENDER_KEYWORDS):
                 return t
-    # Fallback: regex scan of the whole cell
-    t_all = text(player_cell)
-    m = re.search(
-        r"(?:[A-Za-zÄÖÜäöüß\- ]*(?:back|verteidiger|defender)[A-Za-zÄÖÜäöüß\- ]*)",
-        t_all, flags=re.IGNORECASE
-    )
-    return m.group(0) if m else ""
-
-
-def club_name_from_anchor(a) -> str:
-    """Extract a club name from an <a> element that may contain only a logo."""
-    if not a:
-        return ""
-    for attr in ("title", "aria-label", "data-original-title"):
-        val = a.get(attr)
-        if val and val.strip():
-            return val.strip()
-    img = a.find("img")
-    if img:
-        for attr in ("alt", "title"):
-            val = img.get(attr)
-            if val and val.strip():
-                return val.strip()
-    # Last resort: visible text (often empty for logo-only links)
-    return text(a)
-
-
-def first_club_from_cell(cell) -> str:
-    a = cell.select_one('a[href*="/startseite/verein/"], a[href*="/verein/"]')
-    return club_name_from_anchor(a) if a else text(cell)
-
-
-def interested_clubs_from_cell(cell) -> str:
-    anchors = cell.select('a[href*="/startseite/verein/"], a[href*="/verein/"]')
-    names = []
-    seen = set()
-    for a in anchors:
-        name = club_name_from_anchor(a)
-        if name and name not in seen:
-            names.append(name)
-            seen.add(name)
-    return ", ".join(names) if names else text(cell)
-
-
-def source_href_from_cell(cell) -> str:
-    # Prefer external sources; else fall back to internal link (normalized with urljoin)
-    for a in cell.select('a[href]'):
-        href = (a.get("href") or "").strip()
-        if href.startswith("http") and "transfermarkt." not in href:
-            return href
-    a = cell.select_one("a[href]")
-    if a:
-        raw = (a.get("href") or "").strip()
-        return urljoin(URL, raw) if raw else ""
     return ""
 
+def extract_additional_info(player_cell) -> Dict[str, str]:
+    info = {
+        "age": "",
+        "nationality": "",
+        "contract_expiry": "",
+        "market_value": "",
+        "transfer_type": "",
+        "rumour_date": "",
+        "profile_link": ""
+    }
+    # Age
+    age_el = player_cell.select_one("td.zentriert.alter")
+    if age_el:
+        info["age"] = text(age_el)
+    # Nationality
+    nat_imgs = player_cell.select("img.flaggenrahmen")
+    nationalities = [img.get("title", "") for img in nat_imgs if img.get("title")]
+    info["nationality"] = ", ".join(nationalities)
+    # Contract expiry and market value
+    smalls = player_cell.select("small")
+    for sm in smalls:
+        t = text(sm)
+        if "Contract expires" in t:
+            info["contract_expiry"] = t.replace("Contract expires:", "").strip()
+        elif "Market value:" in t:
+            info["market_value"] = t.replace("Market value:", "").strip()
+    # Transfer type
+    transfer_type_el = player_cell.find("span", class_="transfer-type")
+    if transfer_type_el:
+        info["transfer_type"] = text(transfer_type_el)
+    # Rumour date
+    date_el = player_cell.find("span", class_="datum")
+    if date_el:
+        info["rumour_date"] = text(date_el)
+    # Profile link
+    link_el = player_cell.select_one("a[href*='/profil/spieler/']")
+    if link_el:
+        info["profile_link"] = urljoin(BASE_URL, link_el.get("href", ""))
+    return info
 
 def render_html(items: List[dict]) -> str:
     def esc(s: str) -> str:
@@ -214,15 +106,19 @@ def render_html(items: List[dict]) -> str:
 
     rows = []
     for it in items:
-        prob_disp = "" if it["probability"] is None else f'{it["probability"]}%'
-        link_html = "" if not it["source_link"] else f'<a href="{esc(it["source_link"])}">Source</a>'
+        link_html = f'<a href="{esc(it["profile_link"])}">Profile</a>' if it["profile_link"] else ""
         rows.append(
             "<tr>"
             f"<td>{esc(it['player'])}</td>"
             f"<td>{esc(it['position'])}</td>"
+            f"<td>{esc(it['age'])}</td>"
+            f"<td>{esc(it['nationality'])}</td>"
+            f"<td>{esc(it['contract_expiry'])}</td>"
+            f"<td>{esc(it['market_value'])}</td>"
+            f"<td>{esc(it['transfer_type'])}</td>"
+            f"<td>{esc(it['rumour_date'])}</td>"
             f"<td>{esc(it['current_club'])}</td>"
             f"<td>{esc(it['interested_club'])}</td>"
-            f"<td style='text-align:center'>{esc(prob_disp)}</td>"
             f"<td>{link_html}</td>"
             "</tr>"
         )
@@ -230,111 +126,50 @@ def render_html(items: List[dict]) -> str:
         "<table border='1' cellspacing='0' cellpadding='6' "
         "style='border-collapse:collapse;font-family:Segoe UI,Arial,Helvetica,sans-serif;font-size:14px;'>"
         "<thead style='background:#f3f4f6'>"
-        "<tr><th>Player</th><th>Position</th><th>Current</th><th>Interested</th><th>Prob</th><th>Link</th></tr>"
+        "<tr><th>Player</th><th>Position</th><th>Age</th><th>Nationality</th><th>Contract Expiry</th>"
+        "<th>Market Value</th><th>Transfer Type</th><th>Rumour Date</th><th>Current Club</th>"
+        "<th>Interested Club</th><th>Profile</th></tr>"
         "</thead>"
         "<tbody>" + "\n".join(rows) + "</tbody></table>"
     )
     title = "Bundesliga Defender Rumours"
     return f"<html><body><h3 style='font-family:Segoe UI,Arial,Helvetica,sans-serif'>{title}</h3>{table}</body></html>"
 
-
 def main():
-    resp = fetch_with_retries(URL)
-    html = resp.text
+    html = fetch_html(URL)
     soup = BeautifulSoup(html, "lxml")
-
     table = soup.select_one("table.items")
     rows = table.select("tbody > tr") if table else []
-    parsed_rows: List[dict] = []
     items: List[dict] = []
 
-    col_idx = map_columns(table) if table else {}
-
     for tr in rows:
-        # Only top-level td's; ignore nested inline-table cells in detailed layout
         tds = tr.find_all("td", recursive=False)
         if not tds:
             continue
-
-        # Player
-        p_idx = col_idx.get("player", 0)
-        player_cell = tds[p_idx] if len(tds) > p_idx else None
-        if not player_cell:
-            continue
-        player_link = player_cell.select_one("a[href*='/profil/spieler/']") or player_cell.select_one("a[href*='/spieler/']")
+        player_cell = tds[0]
+        player_link = player_cell.select_one("a[href*='/profil/spieler/']")
         player = text(player_link) if player_link else text(player_cell)
-
-        # Position from the player cell
-        pos_txt = extract_position_from_player_cell(player_cell)
-
-        # Row-level text for fallbacks
-        row_txt = " ".join(text(td) for td in tds)
-        if not pos_txt and is_defender(row_txt):
-            m = re.search(
-                r"(?:[A-Za-zÄÖÜäöüß\- ]*(?:back|verteidiger|defender)[A-Za-zÄÖÜäöüß\- ]*)",
-                row_txt, flags=re.IGNORECASE
-            )
-            pos_txt = m.group(0) if m else ""
-
-        # Clubs
-        cur_idx = col_idx.get("current_club", 2)
-        int_idx = col_idx.get("interested_club", 3)
-        current_club = first_club_from_cell(tds[cur_idx]) if len(tds) > cur_idx else ""
-        interested = interested_clubs_from_cell(tds[int_idx]) if len(tds) > int_idx else ""
-
-        # Source link
-        src_idx = col_idx.get("source", 4)
-        source_cell = tds[src_idx] if len(tds) > src_idx else None
-        source_link = source_href_from_cell(source_cell) if source_cell else ""
-
-        # Probability (prefer cell, then scan the row)
-        pr_idx = col_idx.get("probability", 5)
-        prob_txt_cell = text(tds[pr_idx]) if len(tds) > pr_idx else ""
-        prob = parse_probability(prob_txt_cell) or parse_probability(row_txt)
-
-        parsed_rows.append({
+        position = extract_position_from_cell(player_cell)
+        if not is_defender(position):
+            continue
+        current_club = text(tds[2]) if len(tds) > 2 else ""
+        interested_club = text(tds[3]) if len(tds) > 3 else ""
+        info = extract_additional_info(player_cell)
+        items.append({
             "player": player,
-            "player_cell_text": text(player_cell),
-            "row_text": row_txt,
-            "position_raw": pos_txt,
+            "position": position or "Defender",
+            "age": info["age"],
+            "nationality": info["nationality"],
+            "contract_expiry": info["contract_expiry"],
+            "market_value": info["market_value"],
+            "transfer_type": info["transfer_type"],
+            "rumour_date": info["rumour_date"],
+            "profile_link": info["profile_link"],
             "current_club": current_club,
-            "interested_club": interested,
-            "probability_raw": prob_txt_cell,
-            "source_link": source_link,
-            "probability": prob,
+            "interested_club": interested_club
         })
 
-    # Filter to defenders after parsing rows
-    for r in parsed_rows:
-        if is_defender(r.get("position_raw") or r.get("player_cell_text") or r.get("row_text")):
-            items.append({
-                "player": r["player"],
-                "position": r["position_raw"] or "Defender",
-                "current_club": r["current_club"],
-                "interested_club": r["interested_club"],
-                "probability": r["probability"],
-                "source_link": r["source_link"],
-            })
-
-    # Sort: known probs first (desc), then name
-    items.sort(key=lambda x: (x["probability"] is None, -(x["probability"] or 0), x["player"]))
-
     os.makedirs("out", exist_ok=True)
-
-    # Debug artifacts if nothing parsed (helps tune selectors)
-    if not rows or not items:
-        with open("out/debug.html", "w", encoding="utf-8") as f:
-            f.write(html)
-        with open("out/rows.json", "w", encoding="utf-8") as f:
-            json.dump({
-                "url": URL,
-                "total_rows": len(rows),
-                "parsed_rows": parsed_rows[:50],  # cap for size
-                "defender_items_count": len(items),
-                "column_index_map": col_idx,
-            }, f, ensure_ascii=False, indent=2)
-
-    # JSON output
     with open("out/defender_rumours.json", "w", encoding="utf-8") as f:
         json.dump({
             "generated_utc": datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
@@ -342,10 +177,7 @@ def main():
             "items": items
         }, f, ensure_ascii=False, indent=2)
 
-    # HTML output (for email)
     with open("out/defender_rumours.html", "w", encoding="utf-8") as f:
         f.write(render_html(items))
 
-
-if __name__ == "__main__":
-    main()
+main()
