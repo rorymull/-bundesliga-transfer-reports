@@ -31,15 +31,19 @@ DEFENDER_KEYWORDS = {
     "außenverteidiger", "aussenverteidiger", "verteidiger",
 }
 
+
 def norm(s: Optional[str]) -> str:
     return re.sub(r"\s+", " ", (s or "")).strip()
+
 
 def text(el) -> str:
     return norm(el.get_text(" ", strip=True)) if el else ""
 
+
 def is_defender(position_text: str) -> bool:
     p = (position_text or "").lower()
     return any(k in p for k in DEFENDER_KEYWORDS)
+
 
 def fetch_with_retries(url: str, max_retries: int = 3, backoff: float = 1.5) -> requests.Response:
     s = requests.Session()
@@ -57,6 +61,7 @@ def fetch_with_retries(url: str, max_retries: int = 3, backoff: float = 1.5) -> 
         raise last_exc
     raise RuntimeError("Unknown error performing GET")
 
+
 def extract_player_details(profile_url: str) -> dict:
     try:
         resp = fetch_with_retries(profile_url)
@@ -70,33 +75,27 @@ def extract_player_details(profile_url: str) -> dict:
         transfer_type = ""
         rumour_date = ""
 
-        if info_box:
-            age_match = re.search(r'Age:\s*(\d+)', info_box.text)
-            if age_match:
-                age = age_match.group(1)
+        # Age
+        age_el = soup.select_one("span[data-zeit]")
+        if age_el:
+            age_text = age_el.get("data-zeit", "")
+            if age_text.isdigit():
+                age = str(int(age_text) // (365 * 24 * 3600))  # convert seconds to years
 
-        nation_el = soup.select_one("span.data-header__label:contains('Citizenship') + span")
-        if nation_el:
-            nationality = text(nation_el)
+        # Nationality
+        nat_els = soup.select("span.flaggenrahmen")
+        if nat_els:
+            nationality = ", ".join([img.get("title", "") for img in nat_els if img.get("title")])
 
+        # Contract expiry
         contract_el = soup.find("span", string=re.compile("Contract expires"))
         if contract_el and contract_el.find_next("span"):
             contract_expiry = text(contract_el.find_next("span"))
 
+        # Market value
         mv_el = soup.select_one("div.data-header__market-value-wrapper")
         if mv_el:
             market_value = text(mv_el)
-
-        # Rumour date and transfer type may be in the rumours table
-        rumour_table = soup.select_one("div.box")
-        if rumour_table:
-            table_text = rumour_table.get_text(" ", strip=True)
-            date_match = re.search(r"Rumour date:\s*(\d{2}/\d{2}/\d{4})", table_text)
-            if date_match:
-                rumour_date = date_match.group(1)
-            type_match = re.search(r"Transfer type:\s*(\w+)", table_text)
-            if type_match:
-                transfer_type = type_match.group(1)
 
         return {
             "age": age,
@@ -104,45 +103,52 @@ def extract_player_details(profile_url: str) -> dict:
             "contract_expiry": contract_expiry,
             "market_value": market_value,
             "transfer_type": transfer_type,
-            "rumour_date": rumour_date
+            "rumour_date": rumour_date,
         }
     except Exception:
         return {
-            "age": "", "nationality": "", "contract_expiry": "",
-            "market_value": "", "transfer_type": "", "rumour_date": ""
+            "age": "",
+            "nationality": "",
+            "contract_expiry": "",
+            "market_value": "",
+            "transfer_type": "",
+            "rumour_date": "",
         }
+
 
 def main():
     resp = fetch_with_retries(URL)
     soup = BeautifulSoup(resp.text, "lxml")
     table = soup.select_one("table.items")
     rows = table.select("tbody > tr") if table else []
+
     items = []
 
     for tr in rows:
         tds = tr.find_all("td", recursive=False)
-        if not tds or len(tds) < 5:
+        if not tds:
             continue
 
         player_cell = tds[0]
         player_link = player_cell.select_one("a[href*='/profil/spieler/']")
         player_name = text(player_link)
-        profile_link = urljoin(BASE_URL, player_link['href']) if player_link else ""
+        profile_href = player_link.get("href") if player_link else ""
+        profile_url = urljoin(BASE_URL, profile_href)
 
         position = ""
         for el in player_cell.select("table.inline-table td, small, span"):
             t = text(el)
-            if is_defender(t):
+            if t and any(k in t.lower() for k in DEFENDER_KEYWORDS):
                 position = t
                 break
 
         if not is_defender(position):
             continue
 
-        current_club = text(tds[2])
-        interested_club = text(tds[3])
+        current_club = text(tds[2]) if len(tds) > 2 else ""
+        interested_club = text(tds[3]) if len(tds) > 3 else ""
 
-        details = extract_player_details(profile_link)
+        details = extract_player_details(profile_url)
 
         items.append({
             "player": player_name,
@@ -153,9 +159,9 @@ def main():
             "market_value": details["market_value"],
             "transfer_type": details["transfer_type"],
             "rumour_date": details["rumour_date"],
-            "profile_link": profile_link,
+            "profile_link": profile_url,
             "current_club": current_club,
-            "interested_club": interested_club
+            "interested_club": interested_club,
         })
 
     os.makedirs("out", exist_ok=True)
@@ -166,4 +172,6 @@ def main():
             "items": items
         }, f, ensure_ascii=False, indent=2)
 
-main()
+
+if __name__ == "__main__":
+    main()
